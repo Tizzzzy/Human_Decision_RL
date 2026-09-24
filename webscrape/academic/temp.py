@@ -1,0 +1,4 @@
+text = """
+In this article, we construct a class of explicit, smooth and spherically symmetric solutions to the asymptotically flat vacuum constraint equations which have ADM mass of arbitrary sign ($- \infty$, negative, zero, positive). As a direct consequence, there exist asymptotically flat vacuum initial data sets whose metrics are exactly negative mass Schwarzschild outside a given ball. We emphasize that our result does not contradict the spacetime positive energy theorem proven by Eichmair, instead it shows that the decay rate at infinity of the symmetric $(0,2)$-tensor $k$ stated in the theorem is sharp. The key argument we use in the article is classical, based on the conformal method, in which the conformal equations are equivalently transformed into a single nonlinear equation of functions of one variable."""
+
+print(len(text.split()))

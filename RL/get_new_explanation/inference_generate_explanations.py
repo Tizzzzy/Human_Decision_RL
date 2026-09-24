@@ -1,0 +1,265 @@
+"""
+Inference script: Use the trained RL policy to generate new explanations.
+
+Loads the trained Qwen3.6-27B policy (LoRA adapter) and generates new explanation hints
+for each text in the input JSON file. Saves results with both original and new explanations.
+
+Input: /gpfs/projects/p32143/RL_human_decision/RL/get_new_explanation/inference_humanRL.json
+Output: /gpfs/projects/p32143/RL_human_decision/RL/get_new_explanation/inference_with_new_explanations.json
+"""
+
+import json
+import os
+from pathlib import Path
+from typing import List, Dict, Any
+
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from peft import PeftModel
+from tqdm import tqdm
+
+
+# ============================================================================
+# Configuration
+# ============================================================================
+PROJECT_ROOT = Path("/gpfs/projects/p32143/RL_human_decision")
+INPUT_FILE = PROJECT_ROOT / "RL/get_new_explanation/inference_humanRL.json"
+OUTPUT_FILE = PROJECT_ROOT / "RL/get_new_explanation/rlvr_explanations.json"
+
+POLICY_MODEL_NAME = "Qwen/Qwen3.6-27B"
+POLICY_CACHE_DIR = "/projects/p32143/cache/huggingface/qwen36_27b"
+LORA_ADAPTER_PATH = "/projects/p32143/RL_human_decision/baseline/rlvr/checkpoints/final_adapter"
+
+# Generation parameters
+MAX_NEW_TOKENS = 512
+TEMPERATURE = 1.0
+TOP_P = 1.0
+REPETITION_PENALTY = 1.1
+DO_SAMPLE = True
+
+# Policy prompt template (same as used in training)
+POLICY_INSTRUCTION = """Task: Analyze the provided text for linguistic markers of AI or human authorship.
+
+Constraints:
+1. Start the response IMMEDIATELY with the bulleted list.
+2. Do NOT provide an introduction, a final verdict, or a summary.
+3. Do NOT group the bullet points into sub-headings (keep it a flat list).
+4. Every bullet point MUST follow one of these two exact templates:
+    - "Look for [linguistic category or type of phrasing]."
+    - "Look for [linguistic category or type of phrasing] like '[short example]'."
+5. When providing examples, you may list multiple words separated by commas (e.g., like "word 1", "word 2").
+6. Do NOT use bolding, italics, or any special Markdown formatting.
+7. Limit the output to exactly 2 to 6 bullet points.
+
+Text:
+```
+{text}
+```
+
+Can you provide an explanation that tells the reader what to focus on?
+
+Explanation:
+"""
+
+
+# ============================================================================
+# Functions
+# ============================================================================
+def load_input_data(filepath: Path) -> List[Dict[str, Any]]:
+    """Load the input JSON file."""
+    print(f"[Data] Loading input from {filepath}")
+    with open(filepath, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    print(f"[Data] Loaded {len(data)} records")
+    return data
+
+
+def load_policy_model_and_tokenizer():
+    """
+    Load the trained policy model (Qwen3.6-27B + LoRA adapter).
+
+    Returns:
+        (policy_model, policy_tokenizer)
+    """
+    print(f"\n[Model] Loading tokenizer from {POLICY_MODEL_NAME}")
+    policy_tokenizer = AutoTokenizer.from_pretrained(
+        POLICY_MODEL_NAME,
+        cache_dir=POLICY_CACHE_DIR,
+        trust_remote_code=True,
+    )
+    if policy_tokenizer.pad_token is None:
+        policy_tokenizer.pad_token = policy_tokenizer.eos_token
+    print("[Model] Tokenizer loaded")
+
+    print(f"[Model] Loading base model {POLICY_MODEL_NAME}")
+    policy_model = AutoModelForCausalLM.from_pretrained(
+        POLICY_MODEL_NAME,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        cache_dir=POLICY_CACHE_DIR,
+        trust_remote_code=True,
+    )
+    print(f"[Model] Base model loaded: {policy_model.num_parameters():,} parameters")
+
+    print(f"[Model] Loading LoRA adapter from {LORA_ADAPTER_PATH}")
+    policy_model = PeftModel.from_pretrained(policy_model, str(LORA_ADAPTER_PATH))
+    print("[Model] LoRA adapter loaded and merged")
+
+    policy_model.eval()
+    for param in policy_model.parameters():
+        param.requires_grad = False
+
+    return policy_model, policy_tokenizer
+
+
+def build_policy_prompt(text: str, tokenizer) -> str:
+    """Build the policy prompt (chat-templated) and disable thinking."""
+    messages = [{"role": "user", "content": POLICY_INSTRUCTION.format(text=text)}]
+    
+    try:
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    except TypeError:
+        # Fallback for some transformer versions
+        return tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+
+
+@torch.no_grad()
+def generate_explanation(
+    policy_model,
+    policy_tokenizer,
+    text: str,
+    device: str = "cuda",
+) -> str:
+    """
+    Generate a new explanation for the given text using the trained policy.
+
+    Args:
+        policy_model: The trained policy model
+        policy_tokenizer: The tokenizer
+        text: The input text to analyze
+        device: Device to run on
+
+    Returns:
+        Generated explanation string (stripped of whitespace)
+    """
+    # Build the prompt
+    prompt = build_policy_prompt(text, policy_tokenizer)
+
+    # Tokenize
+    inputs = policy_tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=5096,
+    ).to(device)
+
+    # Generate
+    output_ids = policy_model.generate(
+        **inputs,
+        max_new_tokens=MAX_NEW_TOKENS,
+        temperature=TEMPERATURE,
+        top_p=TOP_P,
+        repetition_penalty=REPETITION_PENALTY,
+        do_sample=DO_SAMPLE,
+        pad_token_id=policy_tokenizer.eos_token_id,
+    )
+
+    # Decode: extract only the generated part (remove prompt)
+    prompt_len = inputs["input_ids"].shape[1]
+    generated_ids = output_ids[0, prompt_len:]
+    explanation = policy_tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+
+    return explanation
+
+
+def process_records(
+    records: List[Dict[str, Any]],
+    policy_model,
+    policy_tokenizer,
+) -> List[Dict[str, Any]]:
+    """
+    Process all records and generate new explanations.
+
+    Args:
+        records: List of input records
+        policy_model: The trained policy model
+        policy_tokenizer: The tokenizer
+
+    Returns:
+        List of records with new explanations added
+    """
+    results = []
+    device = next(policy_model.parameters()).device
+
+    print(f"\n[Inference] Generating new explanations for {len(records)} texts...")
+    for i, record in enumerate(tqdm(records, desc="Generating explanations")):
+        try:
+            text = record["text"]
+            explanation = generate_explanation(policy_model, policy_tokenizer, text, device=str(device))
+
+            # Add new explanation to record
+            result = record.copy()
+            result["new_explanation"] = explanation
+            results.append(result)
+
+        except Exception as e:
+            print(f"\n[Warning] Error processing record {i} (text_id={record.get('text_id')}): {e}")
+            # Include record even if generation fails, with empty explanation
+            result = record.copy()
+            result["new_explanation"] = "[GENERATION_FAILED]"
+            results.append(result)
+
+    return results
+
+
+def save_output(results: List[Dict[str, Any]], filepath: Path) -> None:
+    """Save the results to a JSON file."""
+    filepath.parent.mkdir(parents=True, exist_ok=True)
+    print(f"\n[Output] Saving results to {filepath}")
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(results, f, indent=2, ensure_ascii=False)
+    print(f"[Output] Saved {len(results)} records")
+
+
+def main():
+    print("\n" + "="*70)
+    print("       INFERENCE: Generate Explanations with Trained RL Policy")
+    print("="*70)
+
+    # Load input data
+    records = load_input_data(INPUT_FILE)
+
+    # Load trained policy model
+    policy_model, policy_tokenizer = load_policy_model_and_tokenizer()
+
+    # Generate new explanations
+    results = process_records(records, policy_model, policy_tokenizer)
+
+    # Save results
+    save_output(results, OUTPUT_FILE)
+
+    print("\n" + "="*70)
+    print(f"Inference complete! Results saved to {OUTPUT_FILE}")
+    print("="*70 + "\n")
+
+    # Print sample results
+    print("Sample output (first 2 records):")
+    for i, record in enumerate(results[:2]):
+        print(f"\n[Record {i+1}] text_id={record['text_id']}")
+        print(f"  Label: {record['label']}")
+        print(f"  Original explanation:\n    {record['explanation'][:200]}...")
+        print(f"  New explanation:\n    {record['new_explanation'][:200]}...")
+
+
+if __name__ == "__main__":
+    main()
